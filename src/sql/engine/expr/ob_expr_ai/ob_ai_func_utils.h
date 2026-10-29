@@ -235,6 +235,8 @@ class ObAIFuncJsonUtils
 public:
   ObAIFuncJsonUtils() {}
   virtual ~ObAIFuncJsonUtils() {}
+  static int finite_number(const ObIJsonBase *node, double &value);
+  static int validate_embedding(ObIJsonBase *node, int64_t dimension = 0);
   static bool ob_is_json_array_all_str(ObJsonArray* json_array);
   static int transform_array_to_json_array(ObIAllocator &allocator, ObArray<ObString> &contents, ObJsonArray *&array);
   static int get_json_object(ObIAllocator &allocator, ObJsonObject *&obj_node);
