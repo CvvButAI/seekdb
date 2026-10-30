@@ -69,6 +69,10 @@ private:
   public:
     // for property and tmp json string
     mutable ObArenaAllocator allocator_;
+    // holds the serialized "<parser_name>.<version>" built by
+    // construct_ft_parser_inner_name, so the common path does not touch allocator_
+    static constexpr int64_t PARSER_NAME_BUF_LEN = 64;
+    char parser_name_buf_[PARSER_NAME_BUF_LEN];
     ObString parser_name_;
     ObString properties_;
     ObObjMeta meta_;

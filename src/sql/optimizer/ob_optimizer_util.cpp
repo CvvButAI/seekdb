@@ -6947,6 +6947,10 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
   bool has_hint = false;
   can_sort_opt = true;
   bool old_can_opt = false;
+  // DDL data copy sorts (e.g. the INSERT ... SELECT ... ORDER BY that builds an index or a
+  // hidden fulltext table) are one-shot sorts over a whole table, while the width/cardinality
+  // guards below are tuned for OLTP sorts. Keep the encoded sort key path available for them.
+  const bool is_ddl_sort = plan.get_optimizer_context().is_online_ddl();
   const ObOptParamHint opt_params = plan.get_optimizer_context().get_global_hint().opt_params_;
   if (OB_FAIL(opt_params.has_opt_param(ObOptParamHint::ENABLE_NEWSORT, has_hint))) {
   } else if (has_hint) {
@@ -6956,9 +6960,16 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
     can_sort_opt &= config::_enable_newsort();
 
     for (int64_t i = 0; OB_SUCC(ret) && can_sort_opt && i < order_keys.count(); i++) {
-      if (!ObOrderPerservingEncoder::can_encode_sortkey(
-                            order_keys.at(i).expr_->get_data_type(),
-                            order_keys.at(i).expr_->get_collation_type())) {
+      const ObObjType key_type = order_keys.at(i).expr_->get_data_type();
+      const ObCollationType key_collation = order_keys.at(i).expr_->get_collation_type();
+      bool can_encode = ObOrderPerservingEncoder::can_encode_sortkey(key_type, key_collation);
+      if (!can_encode && is_ddl_sort && ObVarcharType == key_type) {
+        // ObOrderPerservingEncoder::encode_from_string_varlen already handles ObVarcharType, so
+        // allow variable length string sort keys for DDL sorts as well (long sort keys are the
+        // norm there, and the guards below are skipped anyway).
+        can_encode = ObOrderPerservingEncoder::can_encode_sortkey(ObCharType, key_collation);
+      }
+      if (!can_encode) {
         can_sort_opt = false;
       } else if (OB_FAIL(sort_keys.push_back(order_keys.at(i).expr_))) {
       } else { /* do nothing */ }
@@ -6970,6 +6981,8 @@ int ObOptimizerUtil::check_can_encode_sortkey(const common::ObIArray<OrderItem> 
       // do nothing
     } else if (!can_sort_opt) {
       // do nothing
+    } else if (is_ddl_sort) {
+      // keep encoded sort keys, the row width may not be estimated for hidden/generated columns
     } else if (OB_FAIL(ObOptEstCost::estimate_width_for_exprs(plan.get_basic_table_metas(),
                                                               plan.get_selectivity_ctx(),
                                                               sort_keys,

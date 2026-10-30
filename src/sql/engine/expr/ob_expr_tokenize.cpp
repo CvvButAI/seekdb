@@ -39,6 +39,170 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+
+// TOKENIZE is a pure function of (text, parser, parser properties): building the
+// ObFTParseHelper (parse the parser name, parse/normalize the property JSON, resolve the
+// parser descriptor) does exactly the same work on every call that shares a parser config.
+// Keep one fully initialized helper plus its arena per thread and recycle the arena between
+// calls, so the hot path only pays for segmentation and result packing.
+class ObFTTokenizeCache
+{
+public:
+  static constexpr int64_t MAX_PARSER_NAME_LEN = 96;
+  static constexpr int64_t MAX_PROPERTIES_LEN = 1024;
+
+  static ObFTTokenizeCache &instance()
+  {
+    static thread_local ObFTTokenizeCache cache;
+    return cache;
+  }
+
+  // Return a ready-to-use helper (whose arena has been recycled) for the given parser
+  // config. OB_SIZE_OVERFLOW tells the caller to fall back to a one-shot helper, which
+  // keeps behavior for exotic (very long) parser properties unchanged.
+  int acquire(const common::ObString &parser_name,
+              const common::ObString &properties,
+              storage::ObFTParseHelper *&helper,
+              common::ObIAllocator *&allocator)
+  {
+    int ret = OB_SUCCESS;
+    helper = nullptr;
+    allocator = nullptr;
+    if (OB_UNLIKELY(parser_name.empty() || parser_name.length() > MAX_PARSER_NAME_LEN
+                    || properties.length() > MAX_PROPERTIES_LEN)) {
+      ret = OB_SIZE_OVERFLOW;
+    } else if (is_same_parser_config(parser_name, properties)) {
+      arena_.reuse();
+      helper = &helper_;
+      allocator = &arena_;
+    } else {
+      helper_.reset();
+      arena_.reuse();
+      if (OB_FAIL(helper_.init(&arena_, parser_name, properties))) {
+        is_valid_ = false;
+      } else {
+        MEMCPY(parser_name_buf_, parser_name.ptr(), parser_name.length());
+        parser_name_len_ = parser_name.length();
+        props_len_ = properties.length();
+        if (properties.length() > 0) {
+          MEMCPY(props_buf_, properties.ptr(), properties.length());
+        }
+        is_valid_ = true;
+        helper = &helper_;
+        allocator = &arena_;
+      }
+    }
+    return ret;
+  }
+
+private:
+  ObFTTokenizeCache()
+    : arena_(lib::ObMemAttr("FTTokenizeCache")),
+      helper_(),
+      parser_name_len_(0),
+      props_len_(0),
+      is_valid_(false)
+  {
+    parser_name_buf_[0] = '\0';
+    props_buf_[0] = '\0';
+  }
+  ~ObFTTokenizeCache() = default;
+
+  bool is_same_parser_config(const common::ObString &parser_name,
+                             const common::ObString &properties) const
+  {
+    return is_valid_
+           && parser_name_len_ == parser_name.length()
+           && props_len_ == properties.length()
+           && 0 == MEMCMP(parser_name_buf_, parser_name.ptr(), parser_name.length())
+           && (0 == properties.length()
+               || 0 == MEMCMP(props_buf_, properties.ptr(), properties.length()));
+  }
+
+private:
+  common::ObArenaAllocator arena_;
+  storage::ObFTParseHelper helper_;
+  char parser_name_buf_[MAX_PARSER_NAME_LEN + 1];
+  char props_buf_[MAX_PROPERTIES_LEN + 1];
+  int64_t parser_name_len_;
+  int64_t props_len_;
+  bool is_valid_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObFTTokenizeCache);
+};
+
+} // anonymous namespace
+
+namespace
+{
+
+// Normalizing parser properties (rebuild_props_for_ddl + to_format_json) is only a function
+// of the parser name when the caller passes no parser properties, which is the common case
+// (`tokenize(text, 'ik')`). Cache the normalized json string per thread so repeated calls
+// skip building and serializing a json object just to hand it to ObFTParseHelper::init.
+class ObFTCanonicalPropsCache
+{
+public:
+  static constexpr int64_t MAX_PARSER_NAME_LEN = 96;
+  static constexpr int64_t MAX_PROPERTIES_LEN = 1024;
+
+  static ObFTCanonicalPropsCache &instance()
+  {
+    static thread_local ObFTCanonicalPropsCache cache;
+    return cache;
+  }
+
+  bool find(const common::ObString &parser_name, common::ObString &properties) const
+  {
+    bool hit = is_valid_
+               && parser_name.length() == parser_name_len_
+               && parser_name.length() > 0
+               && 0 == MEMCMP(parser_name_buf_, parser_name.ptr(), parser_name.length());
+    if (hit) {
+      properties = common::ObString(static_cast<int32_t>(props_len_), props_buf_);
+    }
+    return hit;
+  }
+
+  void store(const common::ObString &parser_name, const common::ObString &properties)
+  {
+    if (parser_name.empty()
+        || parser_name.length() > MAX_PARSER_NAME_LEN
+        || properties.length() > MAX_PROPERTIES_LEN) {
+      is_valid_ = false;
+    } else {
+      MEMCPY(parser_name_buf_, parser_name.ptr(), parser_name.length());
+      parser_name_len_ = parser_name.length();
+      if (properties.length() > 0) {
+        MEMCPY(props_buf_, properties.ptr(), properties.length());
+      }
+      props_len_ = properties.length();
+      is_valid_ = true;
+    }
+  }
+
+private:
+  ObFTCanonicalPropsCache() : parser_name_len_(0), props_len_(0), is_valid_(false)
+  {
+    parser_name_buf_[0] = '\0';
+    props_buf_[0] = '\0';
+  }
+  ~ObFTCanonicalPropsCache() = default;
+
+private:
+  char parser_name_buf_[MAX_PARSER_NAME_LEN + 1];
+  char props_buf_[MAX_PROPERTIES_LEN + 1];
+  int64_t parser_name_len_;
+  int64_t props_len_;
+  bool is_valid_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObFTCanonicalPropsCache);
+};
+
+} // anonymous namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -81,20 +245,37 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParseHelper tokenize_helper;
+  storage::ObFTParseHelper local_helper;
+  storage::ObFTParseHelper *tokenize_helper = nullptr;
+  common::ObIAllocator *helper_allocator = nullptr;
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
   storage::ObFTWordMap token_map;
 
-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
-
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
+  } else if (OB_FAIL(ObFTTokenizeCache::instance().acquire(param.parser_name_,
+                                                           param.properties_,
+                                                           tokenize_helper,
+                                                           helper_allocator))) {
+    if (OB_SIZE_OVERFLOW != ret) {
+    } else {
+      // parser config too long to cache, keep the original one-shot behavior
+      ret = OB_SUCCESS;
+      if (OB_FAIL(local_helper.init(&allocator, param.parser_name_, param.properties_))) {
+      } else {
+        tokenize_helper = &local_helper;
+        helper_allocator = &allocator;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(tokenize_helper) || OB_ISNULL(helper_allocator)) {
+    ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
   } else if (
       (0 != param.fulltext_.length())
-      && OB_FAIL(tokenize_helper.segment(
+      && OB_FAIL(tokenize_helper->segment(
                      param.meta_,
                      param.fulltext_.ptr(),
                      param.fulltext_.length(),
@@ -103,14 +284,14 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
   } else {
     switch (param.output_mode_) {
     case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
+      if (OB_FAIL(tokenize_helper->make_token_array_json(token_map, result))) {
       } else {
         // pass
       }
       break;
     }
     case TokenizeParam::OUTPUT_MODE::ALL: {
-      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
+      if (OB_FAIL(tokenize_helper->make_detail_json(token_map, doc_len, result))) {
       } else {
         // pass
       }
@@ -223,14 +404,13 @@ int ObExprTokenize::construct_ft_parser_inner_name(const ObString &input_str, To
   int ret = OB_SUCCESS;
   storage::ObFTParser parser;
 
-  char *parser_name_buf = nullptr;
-  if (OB_ISNULL(parser_name_buf
-                = static_cast<char *>(param.allocator_.alloc(storage::OB_FT_PARSER_NAME_LENGTH)))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
+  if (OB_UNLIKELY(storage::OB_FT_PARSER_NAME_LENGTH > TokenizeParam::PARSER_NAME_BUF_LEN)) {
+    ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parser.init(input_str))) {
-  } else if (OB_FAIL(parser.serialize_to_str(parser_name_buf, storage::OB_FT_PARSER_NAME_LENGTH))) {
+  } else if (OB_FAIL(parser.serialize_to_str(param.parser_name_buf_,
+                                             TokenizeParam::PARSER_NAME_BUF_LEN))) {
   } else {
-    param.parser_name_ = ObString::make_string(parser_name_buf);
+    param.parser_name_ = ObString::make_string(param.parser_name_buf_);
   }
   return ret;
 }
@@ -376,14 +556,22 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
 {
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
+  ObFTCanonicalPropsCache &props_cache = ObFTCanonicalPropsCache::instance();
+  ObString cached_properties;
 
-  if (OB_FAIL(parser_properties.init())) {
+  if (properties.empty() && props_cache.find(parser_name_, cached_properties)) {
+    // the normalized form only depends on the parser name here, reuse it instead of
+    // rebuilding a json object and serializing it on every call
+    properties_ = cached_properties;
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
                                                              ObCollationType::CS_TYPE_UTF8MB4_BIN,
                                                              true))) {
   } else if (OB_FAIL(parser_properties.to_format_json(allocator_, properties_))) {
+  } else if (properties.empty()) {
+    props_cache.store(parser_name_, properties_);
   }
 
   return ret;

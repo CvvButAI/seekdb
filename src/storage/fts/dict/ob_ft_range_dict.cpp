@@ -381,23 +381,42 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
-  bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+  // Ranges are pushed in ascending order of start_ (see build_dict_from_cache), so a binary
+  // search finds the last range whose start_ <= single_word and avoids walking every range
+  // (two collation-aware string comparisons each) on the per-character tokenize hot path.
+  // Then walk back over the (normally empty) set of ranges sharing that boundary word so the
+  // first containing range wins, exactly like the previous linear scan did.
+  int64_t candidate = -1;
+  int64_t left = 0;
+  int64_t right = range_dicts_.size() - 1;
+  while (OB_SUCC(ret) && left <= right) {
+    const int64_t mid = left + (right - left) / 2;
     if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
+                          range_dicts_[mid].start_.get_word(),
                           single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
-      found = true;
+        <= 0) {
+      candidate = mid;
+      left = mid + 1;
+    } else {
+      right = mid - 1;
     }
   }
-  if (!found) {
+  int64_t found = -1;
+  for (int64_t i = candidate; OB_SUCC(ret) && i >= 0; --i) {
+    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                          range_dicts_[i].end_.get_word(),
+                          single_word)
+        >= 0) {
+      found = i;
+    } else {
+      break;
+    }
+  }
+  if (found < 0) {
     // not found, dis match
     ret = OB_ENTRY_NOT_EXIST;
+  } else {
+    dict = range_dicts_[found].dict_;
   }
   return ret;
 }
